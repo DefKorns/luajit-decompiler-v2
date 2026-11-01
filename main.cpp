@@ -8,9 +8,14 @@ struct Error {
 	const std::string line;
 };
 
-static const HANDLE CONSOLE_OUTPUT = GetStdHandle(STD_OUTPUT_HANDLE);
-//static const HANDLE CONSOLE_INPUT = GetStdHandle(STD_INPUT_HANDLE);
-static bool isCommandLine;
+#ifndef _WIN32
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+namespace fs = std::filesystem;
+
+static bool isCommandLine = true;
 static bool isProgressBarActive = false;
 static uint32_t filesSkipped = 0;
 
@@ -44,34 +49,36 @@ static std::string string_to_lowercase(const std::string& string) {
 }
 
 static void find_files_recursively(Directory& directory) {
-	WIN32_FIND_DATAA pathData;
-	HANDLE handle = FindFirstFileA((arguments.inputPath + directory.path + '*').c_str(), &pathData);
-	if (handle == INVALID_HANDLE_VALUE) return;
+	std::error_code error;
+	std::vector<fs::directory_entry> entries;
 
-	do {
-		if (pathData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-			if (!std::strcmp(pathData.cFileName, ".") || !std::strcmp(pathData.cFileName, "..")) continue;
-			directory.folders.emplace_back(Directory{ .path = directory.path + pathData.cFileName + "\\" });
+	for (fs::directory_iterator it(fs::path(arguments.inputPath + directory.path), error), end; !error && it != end; it.increment(error)) {
+		entries.emplace_back(*it);
+	}
+
+	std::sort(entries.begin(), entries.end());
+
+	for (const fs::directory_entry& entry : entries) {
+		const std::string name = entry.path().filename().string();
+
+		if (entry.is_directory(error)) {
+			directory.folders.emplace_back(Directory{ .path = directory.path + name + "/" });
 			find_files_recursively(directory.folders.back());
 			if (!directory.folders.back().files.size() && !directory.folders.back().folders.size()) directory.folders.pop_back();
 			continue;
 		}
 
-		if (!arguments.extensionFilter.size() || arguments.extensionFilter == string_to_lowercase(PathFindExtensionA(pathData.cFileName))) directory.files.emplace_back(pathData.cFileName);
-	} while (FindNextFileA(handle, &pathData));
-
-	FindClose(handle);
+		if (!arguments.extensionFilter.size() || arguments.extensionFilter == string_to_lowercase(entry.path().extension().string())) directory.files.emplace_back(name);
+	}
 }
 
 static bool decompile_files_recursively(const Directory& directory) {
-	CreateDirectoryA((arguments.outputPath + directory.path).c_str(), NULL);
+	std::error_code error;
+	fs::create_directories(fs::path(arguments.outputPath + directory.path), error);
 	std::string outputFile;
 
 	for (uint32_t i = 0; i < directory.files.size(); i++) {
-		outputFile = directory.files[i];
-		PathRemoveExtensionA(outputFile.data());
-		outputFile = outputFile.c_str();
-		outputFile += ".lua";
+		outputFile = fs::path(directory.files[i]).replace_extension(".lua").string();
 
 		Bytecode bytecode(arguments.inputPath + directory.path + directory.files[i]);
 		Ast ast(bytecode, arguments.ignoreDebugInfo, arguments.minimizeDiffs);
@@ -88,13 +95,8 @@ static bool decompile_files_recursively(const Directory& directory) {
 		} catch (const Error& error) {
 			erase_progress_bar();
 
-			if (arguments.silentAssertions) {
-				print("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\n" + error.message);
-				filesSkipped++;
-				continue;
-			}
-
-			switch (MessageBoxA(NULL, ("Error running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\nFile: " + error.filePath + "\n\n" + error.message).c_str(),
+#ifdef _WIN32
+			if (!arguments.silentAssertions) switch (MessageBoxA(NULL, ("Error running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\nFile: " + error.filePath + "\n\n" + error.message).c_str(),
 				PROGRAM_NAME, MB_ICONERROR | MB_CANCELTRYCONTINUE | MB_DEFBUTTON3)) {
 			case IDCANCEL:
 				return false;
@@ -105,9 +107,19 @@ static bool decompile_files_recursively(const Directory& directory) {
 			case IDCONTINUE:
 				print("File skipped.");
 				filesSkipped++;
+				continue;
 			}
+#endif
+			// No pop-up (silent mode, or not Windows): report the error and skip the file
+			print("\nError running " + error.function + "\nSource: " + error.source + ":" + error.line + "\n\nFile: " + error.filePath + "\n\n" + error.message);
+			filesSkipped++;
+			continue;
 		} catch (...) {
+#ifdef _WIN32
 			MessageBoxA(NULL, std::string("Unknown exception\n\nFile: " + bytecode.filePath).c_str(), PROGRAM_NAME, MB_ICONERROR | MB_OK);
+#else
+			print("Unknown exception\n\nFile: " + bytecode.filePath);
+#endif
 			throw;
 		}
 	}
@@ -215,14 +227,17 @@ static char* parse_arguments(const int& argc, char** const& argv) {
 
 static void wait_for_exit() {
 	if (isCommandLine) return;
+#ifdef _WIN32
 	print("Press any key to exit.");
 
 	while (!_kbhit()) {
 		Sleep(0);
 	};
+#endif
 }
 
-int main(int argc, char* argv[]) {
+static int run(int argc, char* argv[]) {
+#ifdef _WIN32
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE);
 
 	{
@@ -236,6 +251,7 @@ int main(int argc, char* argv[]) {
 		if (!isCommandLine) SetWindowTextA(window, PROGRAM_NAME);
 #endif
 	}
+#endif
 
 	print(std::string(PROGRAM_NAME) + "\nCompiled on " + __DATE__);
 	
@@ -265,6 +281,7 @@ int main(int argc, char* argv[]) {
 	if (!arguments.inputPath.size()) {
 		print("No input path specified!");
 		if (isCommandLine) return EXIT_FAILURE;
+#ifdef _WIN32
 		arguments.inputPath.resize(MAX_PATH, NULL);
 		OPENFILENAMEA dialogInfo = {
 			.lStructSize = sizeof(OPENFILENAMEA),
@@ -283,26 +300,29 @@ int main(int argc, char* argv[]) {
 		print("Please select a valid LuaJIT bytecode file.");
 		if (!GetOpenFileNameA(&dialogInfo)) return EXIT_FAILURE;
 		arguments.inputPath = arguments.inputPath.c_str();
+#else
+		return EXIT_FAILURE;
+#endif
 	}
 
-	DWORD pathAttributes;
+	std::error_code error;
 
 	if (!arguments.outputPath.size()) {
-		arguments.outputPath.resize(MAX_PATH);
-		GetModuleFileNameA(NULL, arguments.outputPath.data(), arguments.outputPath.size());
-		*PathFindFileNameA(arguments.outputPath.data()) = '\x00';
-		arguments.outputPath = arguments.outputPath.c_str();
-		arguments.outputPath += "output\\";
-		arguments.outputPath.shrink_to_fit();
+#ifdef _WIN32
+		std::string modulePath(MAX_PATH, '\x00');
+		modulePath.resize(GetModuleFileNameA(NULL, modulePath.data(), modulePath.size()));
+		arguments.outputPath = (fs::path(modulePath).parent_path() / "output").string() + "/";
+#else
+		arguments.outputPath = (fs::read_symlink("/proc/self/exe", error).parent_path() / "output").string() + "/";
+#endif
+		fs::create_directories(fs::path(arguments.outputPath), error);
 	} else {
-		pathAttributes = GetFileAttributesA(arguments.outputPath.c_str());
-
-		if (pathAttributes == INVALID_FILE_ATTRIBUTES) {
+		if (!fs::exists(fs::path(arguments.outputPath), error)) {
 			print("Failed to open output path: " + arguments.outputPath);
 			return EXIT_FAILURE;
 		}
 
-		if (!(pathAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+		if (!fs::is_directory(fs::path(arguments.outputPath), error)) {
 			print("Output path is not a folder!");
 			return EXIT_FAILURE;
 		}
@@ -312,7 +332,7 @@ int main(int argc, char* argv[]) {
 		case '\\':
 			break;
 		default:
-			arguments.outputPath += '\\';
+			arguments.outputPath += '/';
 			break;
 		}
 	}
@@ -322,9 +342,7 @@ int main(int argc, char* argv[]) {
 		arguments.extensionFilter = string_to_lowercase(arguments.extensionFilter);
 	}
 
-	pathAttributes = GetFileAttributesA(arguments.inputPath.c_str());
-
-	if (pathAttributes == INVALID_FILE_ATTRIBUTES) {
+	if (!fs::exists(fs::path(arguments.inputPath), error)) {
 		print("Failed to open input path: " + arguments.inputPath);
 		wait_for_exit();
 		return EXIT_FAILURE;
@@ -332,13 +350,13 @@ int main(int argc, char* argv[]) {
 
 	Directory root;
 
-	if (pathAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+	if (fs::is_directory(fs::path(arguments.inputPath), error)) {
 		switch (arguments.inputPath.back()) {
 		case '/':
 		case '\\':
 			break;
 		default:
-			arguments.inputPath += '\\';
+			arguments.inputPath += '/';
 			break;
 		}
 
@@ -350,9 +368,9 @@ int main(int argc, char* argv[]) {
 			return EXIT_FAILURE;
 		}
 	} else {
-		root.files.emplace_back(PathFindFileNameA(arguments.inputPath.c_str()));
-		*PathFindFileNameA(arguments.inputPath.c_str()) = '\x00';
-		arguments.inputPath = arguments.inputPath.c_str();
+		const fs::path inputFile(arguments.inputPath);
+		root.files.emplace_back(inputFile.filename().string());
+		arguments.inputPath = inputFile.has_parent_path() ? inputFile.parent_path().string() + "/" : "";
 	}
 
 	try {
@@ -372,8 +390,41 @@ int main(int argc, char* argv[]) {
 	return EXIT_SUCCESS;
 }
 
+#ifdef _WIN32
+int main(int argc, char* argv[]) {
+	return run(argc, argv);
+}
+#else
+// The AST code is deeply recursive, so run on a thread with a big stack (the Windows build links with /stack:268435456)
+struct MainArguments {
+	int argc;
+	char** argv;
+	int result;
+};
+
+static void* run_thread(void* data) {
+	MainArguments& mainArguments = *static_cast<MainArguments*>(data);
+	mainArguments.result = run(mainArguments.argc, mainArguments.argv);
+	return nullptr;
+}
+
+int main(int argc, char* argv[]) {
+	MainArguments mainArguments = { argc, argv, EXIT_FAILURE };
+	pthread_attr_t attributes;
+	pthread_t thread;
+	pthread_attr_init(&attributes);
+	pthread_attr_setstacksize(&attributes, 268435456);
+
+	if (pthread_create(&thread, &attributes, run_thread, &mainArguments)) return run(argc, argv);
+
+	pthread_join(thread, nullptr);
+	return mainArguments.result;
+}
+#endif
+
 void print(const std::string& message) {
-	WriteConsoleA(CONSOLE_OUTPUT, (message + '\n').data(), message.size() + 1, NULL, NULL);
+	std::fwrite((message + '\n').data(), 1, message.size() + 1, stdout);
+	std::fflush(stdout);
 }
 
 /*
@@ -395,7 +446,8 @@ void print_progress_bar(const double& progress, const double& total) {
 		PROGRESS_BAR[i + 2] = i < threshold ? '=' : ' ';
 	}
 
-	WriteConsoleA(CONSOLE_OUTPUT, PROGRESS_BAR, sizeof(PROGRESS_BAR) - 1, NULL, NULL);
+	std::fwrite(PROGRESS_BAR, 1, sizeof(PROGRESS_BAR) - 1, stdout);
+	std::fflush(stdout);
 	isProgressBarActive = true;
 }
 
@@ -403,7 +455,8 @@ void erase_progress_bar() {
 	static constexpr char PROGRESS_BAR_ERASER[] = "\r                      \r";
 
 	if (!isProgressBarActive) return;
-	WriteConsoleA(CONSOLE_OUTPUT, PROGRESS_BAR_ERASER, sizeof(PROGRESS_BAR_ERASER) - 1, NULL, NULL);
+	std::fwrite(PROGRESS_BAR_ERASER, 1, sizeof(PROGRESS_BAR_ERASER) - 1, stdout);
+	std::fflush(stdout);
 	isProgressBarActive = false;
 }
 

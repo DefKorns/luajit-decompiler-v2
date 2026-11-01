@@ -1,30 +1,40 @@
 /*
 Requirements:
-  Visual Studio
-  C++20
-  Windows API
-  Default char is unsigned (/J)
+  C++20 (Visual Studio, GCC or Clang)
+  Default char is unsigned (/J on MSVC, -funsigned-char on GCC/Clang)
+  Windows only: Windows API for the file dialog and error pop-ups
 */
 
-#ifndef _CHAR_UNSIGNED
+#if !defined(_CHAR_UNSIGNED) && !defined(__CHAR_UNSIGNED__)
 #error Default char is not unsigned!
 #endif
 
+#ifdef _MSC_VER
 #pragma comment(linker, "/stack:268435456")
 #pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #pragma comment(lib, "shlwapi.lib")
+#endif
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#ifdef _WIN32
 #include <windows.h>
 #include <conio.h>
 #include <fileapi.h>
 #include <shlwapi.h>
+#endif
+
+// The decompiler defines its own assert() function
+#undef assert
 
 #define DEBUG_INFO __FUNCTION__, __FILE__, __LINE__
 
@@ -46,6 +56,6 @@ class Bytecode;
 class Ast;
 class Lua;
 
-#include "bytecode\bytecode.h"
-#include "ast\ast.h"
-#include "lua\lua.h"
+#include "bytecode/bytecode.h"
+#include "ast/ast.h"
+#include "lua/lua.h"
